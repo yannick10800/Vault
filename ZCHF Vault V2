@@ -1,0 +1,1080 @@
+# pragma version 0.4.3
+# pragma optimize codesize
+"""
+@title  Levered svZCHF -> crvUSD -> yvcrvUSD-2 carry loop, as a Yearn V3 strategy
+@notice ZCHF in  -> svZCHF -> LlamaLend collateral -> borrow crvUSD @ target LTV -> Yearn vault
+        ZCHF out <- unwrap svZCHF <- free collateral <- repay debt <- redeem Yearn vault
+@dev    Self-contained ERC20 + ERC4626 over ZCHF. VaultV3.vy is the depositor and share
+        holder, driving everything through IStrategy: asset(), maxDeposit(), report(),
+        deposit(assets,receiver), redeem(shares,receiver,owner).
+        Vault shares minted to us by the vault are NOT counted in totalAssets(); the vault
+        already books that profit in strategy.current_debt.
+"""
+
+# ================================ interfaces ================================
+
+interface IERC20:
+    def approve(_spender: address, _amount: uint256) -> bool: nonpayable
+    def transfer(_to: address, _amount: uint256) -> bool: nonpayable
+    def transferFrom(_from: address, _to: address, _amount: uint256) -> bool: nonpayable
+    def balanceOf(_owner: address) -> uint256: view
+    def allowance(_owner: address, _spender: address) -> uint256: view
+
+interface IERC4626:
+    def asset() -> address: view
+    def balanceOf(_owner: address) -> uint256: view
+    def totalAssets() -> uint256: view
+    def convertToShares(_assets: uint256) -> uint256: view
+    def convertToAssets(_shares: uint256) -> uint256: view
+    def previewDeposit(_assets: uint256) -> uint256: view
+    def previewWithdraw(_assets: uint256) -> uint256: view
+    def pricePerShare() -> uint256: view
+    def maxDeposit(_owner: address) -> uint256: view
+    def maxRedeem(_owner: address) -> uint256: view
+    def maxWithdraw(_owner: address) -> uint256: view
+    def deposit(_assets: uint256, _receiver: address) -> uint256: nonpayable
+    def redeem(_shares: uint256, _receiver: address, _owner: address) -> uint256: nonpayable
+
+# @dev Every _d_* / _collateral / _debt param on LlamaLend v2 is a DELTA.
+interface ILendController:
+    def create_loan(_collateral: uint256, _debt: uint256, _N: uint256, _for: address): nonpayable
+    def borrow_more(_collateral: uint256, _debt: uint256, _for: address): nonpayable
+    def add_collateral(_collateral: uint256, _for: address): nonpayable
+    def remove_collateral(_collateral: uint256, _for: address): nonpayable
+    def repay(_wallet_d_debt: uint256, _for: address): nonpayable
+    def max_borrowable(_d_collateral: uint256, _N: uint256, _user: address) -> uint256: view
+    def debt(_user: address) -> uint256: view
+    def loan_exists(_user: address) -> bool: view
+    def user_state(_user: address) -> uint256[4]: view
+    def available_balance() -> uint256: view
+    def borrow_cap() -> uint256: view
+    def total_debt() -> uint256: view
+    def loan_discount() -> uint256: view
+    def extra_health(_user: address) -> uint256: view
+    def amm() -> address: view
+    def vault() -> address: view
+    def remove_collateral_health_preview(_collateral: uint256, _for: address, _full: bool) -> int256: view
+
+interface IAMM:
+    def price_oracle() -> uint256: view
+    def rate() -> uint256: view
+
+interface ICurveStableSwap:
+    def get_dy(i: int128, j: int128, dx: uint256) -> uint256: view
+    def exchange(i: int128, j: int128, dx: uint256, min_dy: uint256) -> uint256: nonpayable
+
+# ================================== events ==================================
+
+event Transfer:
+    sender: indexed(address)
+    receiver: indexed(address)
+    value: uint256
+
+event Approval:
+    owner: indexed(address)
+    spender: indexed(address)
+    value: uint256
+
+event Deposit:
+    sender: indexed(address)
+    owner: indexed(address)
+    assets: uint256
+    shares: uint256
+
+event Withdraw:
+    sender: indexed(address)
+    receiver: indexed(address)
+    owner: indexed(address)
+    assets: uint256
+    shares: uint256
+
+event VaultSet:
+    vault: address
+
+event ParamsSet:
+    targetLtvBps: uint256
+    bands: uint256
+
+event SwapPoolSet:
+    pool: address
+    iCrvUsd: int128
+    iZchf: int128
+
+event WithdrawBufferSet:
+    crvUsd: uint256
+    maxBps: uint256
+
+event SpreadGuardSet:
+    enabled: bool
+    tolerance: int256
+    reducedLtvBps: uint256
+    minAprWindow: uint256
+
+event ShutdownSet:
+    shutdown: bool
+
+event Invested:
+    assets: uint256
+    collateralShares: uint256
+    borrowed: uint256
+
+event Divested:
+    assets: uint256
+    collateralShares: uint256
+    repaid: uint256
+
+event SurplusRealized:
+    crvUsd: uint256
+    zchf: uint256
+
+event BufferConverted:
+    crvUsd: uint256
+    zchf: uint256
+
+event DeficitCovered:
+    zchfIn: uint256
+    crvUsdOut: uint256
+
+event SpreadChecked:
+    spread: int256
+    reduced: bool
+    effectiveLtvBps: uint256
+
+event Deleveraged:
+    crvUsdRepaid: uint256
+    spread: int256
+
+event Swept:
+    token: address
+    amount: uint256
+
+# ================================ constants =================================
+
+ZCHF:           constant(address) = 0xb58e61c3098d85632df34eecfb899a1ed80921cb
+CRVUSD:         constant(address) = 0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E
+SVZCHF:         constant(address) = 0xE5F130253fF137f9917C0107659A4c5262abf6b0
+YEARN_CRVUSD:   constant(address) = 0xBF319dDC2Edc1Eb6FDf9910E39b37Be221C8805F
+CONTROLLER:     constant(address) = 0xFd85e847cDd2549f213E276e4B57B0690169F043
+
+WAD:            constant(uint256) = 10 ** 18
+BPS:            constant(uint256) = 10_000
+
+# =================================== state ==================================
+
+# --- ERC20 ---
+name: public(String[64])
+symbol: public(String[32])
+decimals: public(uint8)
+balanceOf: public(HashMap[address, uint256])
+allowance: public(HashMap[address, HashMap[address, uint256]])
+totalSupply: public(uint256)
+
+# --- roles ---
+owner: public(address)
+pendingOwner: public(address)
+keeper: public(address)
+emergencyAdmin: public(address)
+vault: public(address)
+shutdown: public(bool)
+
+# --- loop params ---
+targetLtvBps: public(uint256)          # 7500 = 75%
+bands: public(uint256)                 # LlamaLend _N, 4..50
+lastTotalAssets: public(uint256)       # report fallback if vault debt is unreadable
+
+# --- crvUSD -> ZCHF conversion route ---
+crvUsdZchfPool: public(address)
+iCrvUsd: public(int128)
+iZchf: public(int128)
+maxSlippageBps: public(uint256)
+
+# --- withdraw crvUSD buffer ---
+withdrawCrvUsdBuffer: public(uint256)  # extra crvUSD converted to ZCHF on every withdraw
+bufferMaxBps: public(uint256)          # never pull more than this share of the Yearn balance
+minConvertCrvUsd: public(uint256)      # dust guard
+
+# --- spread guard ---
+spreadGuardEnabled: public(bool)
+spreadTolerance: public(int256)        # +/- dead-band, 1e18
+reducedLtvBps: public(uint256)         # de-lever target when carry is negative
+minAprWindow: public(uint256)
+lastYearnPps: public(uint256)
+lastPpsTimestamp: public(uint256)
+cachedLendApr: public(uint256)         # realised Yearn APR, 1e18
+
+# ================================== deploy ==================================
+
+@deploy
+def __init__():
+    self.owner = msg.sender
+    self.keeper = msg.sender
+    self.emergencyAdmin = msg.sender
+    self.name = "Levered svZCHF Loop Strategy"
+    self.symbol = "stZCHF"
+    self.decimals = 18
+    self.targetLtvBps = 7_500
+    self.bands = 10
+    self.maxSlippageBps = 100
+    self.withdrawCrvUsdBuffer = 10 ** 18
+    self.bufferMaxBps = 5_000
+    self.spreadGuardEnabled = True
+    self.spreadTolerance = 5 * 10 ** 15          # 0.5%
+    self.reducedLtvBps = 3_000
+    self.minAprWindow = 86_400
+
+# ================================== admin ===================================
+
+@external
+def transferOwnership(_new: address):
+    assert msg.sender == self.owner, "!owner"
+    self.pendingOwner = _new
+
+@external
+def acceptOwnership():
+    assert msg.sender == self.pendingOwner, "!pending"
+    self.owner = msg.sender
+    self.pendingOwner = empty(address)
+
+@external
+def setVault(_vault: address):
+    assert msg.sender == self.owner, "!owner"
+    assert self.vault == empty(address), "set"
+    assert staticcall IERC4626(_vault).asset() == ZCHF, "asset"
+    self.vault = _vault
+    log VaultSet(_vault)
+
+@external
+def setKeeper(_k: address):
+    assert msg.sender == self.owner, "!owner"
+    self.keeper = _k
+
+@external
+def setEmergencyAdmin(_a: address):
+    assert msg.sender == self.owner, "!owner"
+    self.emergencyAdmin = _a
+
+@external
+def setParams(_targetLtvBps: uint256, _bands: uint256):
+    assert msg.sender == self.owner, "!owner"
+    assert 1_000 <= _targetLtvBps and _targetLtvBps <= 9_000, "ltv"
+    assert 4 <= _bands and _bands <= 50, "bands"
+    self.targetLtvBps = _targetLtvBps
+    self.bands = _bands
+    log ParamsSet(_targetLtvBps, _bands)
+
+@external
+def setSwapPool(_pool: address, _iCrvUsd: int128, _iZchf: int128, _maxSlippageBps: uint256):
+    assert msg.sender == self.owner, "!owner"
+    assert _maxSlippageBps <= 1_000, "slippage"
+    self.crvUsdZchfPool = _pool
+    self.iCrvUsd = _iCrvUsd
+    self.iZchf = _iZchf
+    self.maxSlippageBps = _maxSlippageBps
+    log SwapPoolSet(_pool, _iCrvUsd, _iZchf)
+
+@external
+def setWithdrawBuffer(_crvUsd: uint256, _maxBps: uint256, _minConvert: uint256):
+    assert msg.sender == self.owner, "!owner"
+    assert _maxBps <= BPS, "bps"
+    self.withdrawCrvUsdBuffer = _crvUsd
+    self.bufferMaxBps = _maxBps
+    self.minConvertCrvUsd = _minConvert
+    log WithdrawBufferSet(_crvUsd, _maxBps)
+
+@external
+def setSpreadGuard(_on: bool, _tolerance: int256, _reducedLtvBps: uint256, _minWindow: uint256):
+    assert msg.sender == self.owner, "!owner"
+    assert _tolerance >= 0 and _tolerance < convert(WAD, int256), "tol"
+    assert 500 <= _reducedLtvBps and _reducedLtvBps <= 9_000, "ltv"
+    self.spreadGuardEnabled = _on
+    self.spreadTolerance = _tolerance
+    self.reducedLtvBps = _reducedLtvBps
+    self.minAprWindow = _minWindow
+    log SpreadGuardSet(_on, _tolerance, _reducedLtvBps, _minWindow)
+
+@external
+def setShutdown(_s: bool):
+    assert msg.sender == self.owner or msg.sender == self.emergencyAdmin, "!auth"
+    self.shutdown = _s
+    log ShutdownSet(_s)
+
+@external
+def sweep(_token: address):
+    assert msg.sender == self.owner, "!owner"
+    assert _token != ZCHF, "asset"
+    b: uint256 = staticcall IERC20(_token).balanceOf(self)
+    assert extcall IERC20(_token).transfer(self.owner, b), "transfer"
+    log Swept(_token, b)
+
+# ========================= ERC20 metadata / asset ===========================
+
+@external
+@view
+def asset() -> address:
+    return ZCHF
+
+# ============================= ERC20 internals ==============================
+
+@internal
+def _mint(_to: address, _amount: uint256):
+    self.totalSupply += _amount
+    self.balanceOf[_to] += _amount
+    log Transfer(empty(address), _to, _amount)
+
+@internal
+def _burn(_from: address, _amount: uint256):
+    self.balanceOf[_from] -= _amount
+    self.totalSupply -= _amount
+    log Transfer(_from, empty(address), _amount)
+
+@internal
+def _spendAllowance(_owner: address, _spender: address, _amount: uint256):
+    a: uint256 = self.allowance[_owner][_spender]
+    if a != max_value(uint256):
+        assert a >= _amount, "allowance"
+        self.allowance[_owner][_spender] = a - _amount
+        log Approval(_owner, _spender, a - _amount)
+
+@external
+def approve(_spender: address, _amount: uint256) -> bool:
+    self.allowance[msg.sender][_spender] = _amount
+    log Approval(msg.sender, _spender, _amount)
+    return True
+
+@external
+def transfer(_to: address, _amount: uint256) -> bool:
+    self.balanceOf[msg.sender] -= _amount
+    self.balanceOf[_to] += _amount
+    log Transfer(msg.sender, _to, _amount)
+    return True
+
+@external
+def transferFrom(_from: address, _to: address, _amount: uint256) -> bool:
+    self._spendAllowance(_from, msg.sender, _amount)
+    self.balanceOf[_from] -= _amount
+    self.balanceOf[_to] += _amount
+    log Transfer(_from, _to, _amount)
+    return True
+
+# =========================== ERC4626 conversion math ========================
+
+@internal
+@view
+def _convertToShares(_assets: uint256, _roundUp: bool) -> uint256:
+    ts: uint256 = self.totalSupply
+    ta: uint256 = self._totalAssets()
+    if ts == 0:
+        return _assets
+    if _roundUp:
+        return (_assets * (ts + 1) + ta) / (ta + 1)
+    return _assets * (ts + 1) / (ta + 1)
+
+@internal
+@view
+def _convertToAssets(_shares: uint256, _roundUp: bool) -> uint256:
+    ts: uint256 = self.totalSupply
+    ta: uint256 = self._totalAssets()
+    if ts == 0:
+        return _shares
+    if _roundUp:
+        return (_shares * (ta + 1) + ts) / (ts + 1)
+    return _shares * (ta + 1) / (ts + 1)
+
+@external
+@view
+def convertToShares(_assets: uint256) -> uint256:
+    return self._convertToShares(_assets, False)
+
+@external
+@view
+def convertToAssets(_shares: uint256) -> uint256:
+    return self._convertToAssets(_shares, False)
+
+@external
+@view
+def previewDeposit(_assets: uint256) -> uint256:
+    return self._convertToShares(_assets, False)
+
+@external
+@view
+def previewMint(_shares: uint256) -> uint256:
+    return self._convertToAssets(_shares, True)
+
+@external
+@view
+def previewWithdraw(_assets: uint256) -> uint256:
+    return self._convertToShares(_assets, True)
+
+@external
+@view
+def previewRedeem(_shares: uint256) -> uint256:
+    return self._convertToAssets(_shares, False)
+
+# ============================== ERC4626 limits ==============================
+
+# @dev Default arg generates BOTH maxDeposit() (VaultV3 IStrategy) and maxDeposit(address).
+@external
+@view
+def maxDeposit(_owner: address = empty(address)) -> uint256:
+    return self._maxDepositAssets()
+
+@external
+@view
+def maxMint(_owner: address = empty(address)) -> uint256:
+    return self._convertToShares(self._maxDepositAssets(), False)
+
+@external
+@view
+def maxWithdraw(_owner: address) -> uint256:
+    freeable: uint256 = self._maxFreeable()
+    owned: uint256 = self._convertToAssets(self.balanceOf[_owner], False)
+    return min(freeable, owned)
+
+@external
+@view
+def maxRedeem(_owner: address) -> uint256:
+    return self._convertToShares(self.maxWithdraw(_owner), False)
+
+@internal
+@view
+def _maxDepositAssets() -> uint256:
+    if self.shutdown:
+        return 0
+    # svZCHF capacity is the binding constraint; zero borrow room is fine.
+    return staticcall IERC4626(SVZCHF).maxDeposit(self)
+
+# =========================== ERC4626 entry points ===========================
+
+@external
+@nonreentrant("lock")
+def deposit(_assets: uint256, _receiver: address = msg.sender) -> uint256:
+    assert _assets <= self._maxDepositAssets(), "maxDeposit"
+    shares: uint256 = self._convertToShares(_assets, False)
+    self._deposit(msg.sender, _receiver, _assets, shares)
+    return shares
+
+@external
+@nonreentrant("lock")
+def mint(_shares: uint256, _receiver: address = msg.sender) -> uint256:
+    assets: uint256 = self._convertToAssets(_shares, True)
+    assert assets <= self._maxDepositAssets(), "maxDeposit"
+    self._deposit(msg.sender, _receiver, assets, _shares)
+    return assets
+
+@external
+@nonreentrant("lock")
+def withdraw(
+    _assets: uint256, _receiver: address = msg.sender, _owner: address = msg.sender
+) -> uint256:
+    assert _assets <= self.maxWithdraw(_owner), "maxWithdraw"
+    shares: uint256 = self._convertToShares(_assets, True)
+    self._withdraw(msg.sender, _receiver, _owner, _assets, shares)
+    return shares
+
+@external
+@nonreentrant("lock")
+def redeem(
+    _shares: uint256, _receiver: address = msg.sender, _owner: address = msg.sender
+) -> uint256:
+    assert _shares <= self.maxRedeem(_owner), "maxRedeem"
+    assets: uint256 = self._convertToAssets(_shares, False)
+    self._withdraw(msg.sender, _receiver, _owner, assets, _shares)
+    return assets
+
+@internal
+def _deposit(_caller: address, _receiver: address, _assets: uint256, _shares: uint256):
+    assert extcall IERC20(ZCHF).transferFrom(_caller, self, _assets), "transferFrom"
+    self._mint(_receiver, _shares)
+    log Deposit(_caller, _receiver, _assets, _shares)
+    if not self.shutdown:
+        self._invest(_assets)
+
+@internal
+def _withdraw(
+    _caller: address, _receiver: address, _owner: address, _assets: uint256, _shares: uint256
+):
+    if _caller != _owner:
+        self._spendAllowance(_owner, _caller, _shares)
+    self._divest(_assets)
+    self._burn(_owner, _shares)
+    assert extcall IERC20(ZCHF).transfer(_receiver, _assets), "transfer"
+    log Withdraw(_caller, _receiver, _owner, _assets, _shares)
+
+# ============================ VaultV3 strategy ==============================
+
+@external
+@nonreentrant("lock")
+def report() -> (uint256, uint256):
+    assert msg.sender == self.vault or msg.sender == self.keeper, "!auth"
+    self._pokePps()
+    assets: uint256 = self._totalAssets()
+    debt: uint256 = self._vaultDebt()
+    self.lastTotalAssets = assets
+    if assets >= debt:
+        return (assets - debt, 0)
+    return (0, debt - assets)
+
+@external
+@view
+def isShutdown() -> bool:
+    return self.shutdown
+
+@external
+@pure
+def apiVersion() -> String[5]:
+    return "3.0.2"
+
+# ============================== spread check ================================
+
+@external
+@view
+def borrowApr() -> uint256:
+    return self._borrowApr()
+
+@external
+@view
+def lendApr() -> uint256:
+    return self.cachedLendApr
+
+@external
+@view
+def spread() -> int256:
+    return convert(self.cachedLendApr, int256) - convert(self._borrowApr(), int256)
+
+@external
+@view
+def spreadIsPositive() -> bool:
+    return convert(self.cachedLendApr, int256) - convert(self._borrowApr(), int256) > self.spreadTolerance
+
+@external
+@view
+def spreadStatus() -> (int256, uint256, uint256, uint256, bool):
+    borrow: uint256 = self._borrowApr()
+    reduced: bool = self._spreadNegative()
+    return (
+        convert(self.cachedLendApr, int256) - convert(borrow, int256),
+        borrow,
+        self.cachedLendApr,
+        self.reducedLtvBps if reduced else self.targetLtvBps,
+        reduced,
+    )
+
+@external
+@nonreentrant("lock")
+def pokePps():
+    self._pokePps()
+
+@internal
+def _pokePps():
+    pps: uint256 = staticcall IERC4626(YEARN_CRVUSD).pricePerShare()
+    t: uint256 = self.lastPpsTimestamp
+    if t == 0:
+        self.lastYearnPps = pps
+        self.lastPpsTimestamp = block.timestamp
+        return
+    dt: uint256 = block.timestamp - t
+    if dt < self.minAprWindow:
+        return
+    if pps > self.lastYearnPps:
+        self.cachedLendApr = (pps - self.lastYearnPps) * WAD / self.lastYearnPps * 365 * 86400 / dt
+    else:
+        self.cachedLendApr = 0
+    self.lastYearnPps = pps
+    self.lastPpsTimestamp = block.timestamp
+
+# @dev Non-reverting static uint256 read (replaces Solidity try/catch).
+@internal
+@view
+def _staticUint256(_target: address, _data: Bytes[4]) -> (bool, uint256):
+    res: Bytes[32] = raw_call(
+        _target, _data, max_outsize=32, is_static_call=True, revert_on_failure=False
+    )
+    if len(res) != 32:
+        return (False, 0)
+    return (True, abi_decode(res, uint256))
+
+@internal
+@view
+def _borrowApr() -> uint256:
+    # Prefer the market Vault's own APR (net of utilisation + admin fee).
+    ok: bool = False
+    v: uint256 = 0
+    (ok, v) = self._staticUint256(
+        staticcall ILendController(CONTROLLER).vault(),
+        method_id("borrow_apr()", output_type=Bytes[4]),
+    )
+    if ok and v > 0:
+        return v
+    (ok, v) = self._staticUint256(
+        staticcall ILendController(CONTROLLER).amm(),
+        method_id("rate()", output_type=Bytes[4]),
+    )
+    if ok:
+        return v * 365 * 86400
+    return 0
+
+# @dev True only when warmed up and the spread is clearly negative.
+@internal
+@view
+def _spreadNegative() -> bool:
+    if not self.spreadGuardEnabled:
+        return False
+    if self.lastPpsTimestamp == 0:
+        return False
+    return convert(self.cachedLendApr, int256) - convert(self._borrowApr(), int256) < -self.spreadTolerance
+
+# @dev LTV the strategy targets right now.
+@internal
+@view
+def _effectiveLtvBps() -> uint256:
+    return self.reducedLtvBps if self._spreadNegative() else self.targetLtvBps
+
+# ============================ keeper operations =============================
+
+@external
+@nonreentrant("lock")
+def rebalance():
+    assert msg.sender == self.vault or msg.sender == self.keeper, "!auth"
+    self._pokePps()
+    if self._spreadNegative():
+        self._coverDeficit()
+
+    n: uint256 = self.bands
+    debt: uint256 = staticcall ILendController(CONTROLLER).debt(self)
+    if debt == 0:
+        self._investIdle()
+        return
+
+    max_more: uint256 = staticcall ILendController(CONTROLLER).max_borrowable(0, n, self)
+    target_total: uint256 = self._targetDebt(max_more, debt)
+
+    if target_total > debt:                      # positive spread -> borrow up, earn carry
+        more: uint256 = self._capByLiquidity(target_total - debt)
+        if more > 0:
+            extcall ILendController(CONTROLLER).borrow_more(0, more, self)
+    elif debt > target_total:                    # negative spread -> repay down
+        redeemed: uint256 = self._redeemCrvUsdFromYearn(debt - target_total)
+        if redeemed > 0:
+            self._approve(CRVUSD, CONTROLLER, redeemed)
+            extcall ILendController(CONTROLLER).repay(redeemed, self)
+
+    self._depositCrvUsdToYearn()
+    log SpreadChecked(self._spread(), self._spreadNegative(), self._effectiveLtvBps())
+
+@external
+@nonreentrant("lock")
+def deleverage():
+    assert msg.sender == self.vault or msg.sender == self.keeper, "!auth"
+    self._pokePps()
+    debt: uint256 = staticcall ILendController(CONTROLLER).debt(self)
+    if debt == 0:
+        return
+
+    max_more: uint256 = staticcall ILendController(CONTROLLER).max_borrowable(0, self.bands, self)
+    discount: uint256 = (
+        staticcall ILendController(CONTROLLER).loan_discount()
+        + staticcall ILendController(CONTROLLER).extra_health(self)
+    )
+    max_ltv: uint256 = WAD if discount >= WAD else WAD - discount
+    target_total: uint256 = (max_more + debt) * (self.reducedLtvBps * WAD / BPS) / max_ltv
+    if debt <= target_total:
+        return
+
+    self._realizeSurplus()
+    redeemed: uint256 = self._redeemCrvUsdFromYearn(debt - target_total)
+    if redeemed > 0:
+        self._approve(CRVUSD, CONTROLLER, redeemed)
+        extcall ILendController(CONTROLLER).repay(redeemed, self)
+    self._depositCrvUsdToYearn()
+    log Deleveraged(redeemed, self._spread())
+
+@external
+@nonreentrant("lock")
+def harvest():
+    assert msg.sender == self.vault or msg.sender == self.keeper, "!auth"
+    self._pokePps()
+    self._realizeSurplus()
+    if self._spreadNegative():
+        self._coverDeficit()
+    self._investIdle()
+
+@external
+@nonreentrant("lock")
+def emergencyWithdraw():
+    assert msg.sender == self.owner or msg.sender == self.emergencyAdmin, "!auth"
+    if self._collateralShares() > 0:
+        self._divest(max_value(uint256))
+    else:
+        self._realizeSurplus()
+    self._depositCrvUsdToYearn()
+
+# ================================ accounting ================================
+
+@external
+@view
+def totalAssets() -> uint256:
+    return self._totalAssets()
+
+@internal
+@view
+def _totalAssets() -> uint256:
+    idle: uint256 = staticcall IERC20(ZCHF).balanceOf(self)
+    coll_zchf: uint256 = staticcall IERC4626(SVZCHF).convertToAssets(self._collateralShares())
+    debt: uint256 = staticcall ILendController(CONTROLLER).debt(self)
+    yearn_crvusd: uint256 = staticcall IERC4626(YEARN_CRVUSD).convertToAssets(
+        staticcall IERC20(YEARN_CRVUSD).balanceOf(self)
+    )
+
+    if yearn_crvusd >= debt:
+        return idle + coll_zchf + self._crvUsdToZchf(yearn_crvusd - debt)
+
+    deficit: uint256 = self._crvUsdToZchf(debt - yearn_crvusd)
+    base: uint256 = idle + coll_zchf
+    return base - deficit if base > deficit else 0
+
+# @dev Upper bound on ZCHF that can leave without breaking health.
+@internal
+@view
+def _maxFreeable() -> uint256:
+    idle: uint256 = staticcall IERC20(ZCHF).balanceOf(self)
+    realisable: uint256 = (
+        self._crvUsdToZchf(self._crvUsdSurplus()) + self._crvUsdToZchf(self._bufferFor())
+    )
+
+    coll_shares: uint256 = self._collateralShares()
+    if coll_shares == 0:
+        return idle + realisable
+
+    coll_zchf: uint256 = staticcall IERC4626(SVZCHF).convertToAssets(coll_shares)
+    debt: uint256 = staticcall ILendController(CONTROLLER).debt(self)
+    if debt == 0:
+        return idle + realisable + coll_zchf
+
+    liquid: uint256 = staticcall IERC4626(YEARN_CRVUSD).maxWithdraw(self)
+    if liquid > debt:
+        liquid = debt
+    removable: uint256 = self._crvUsdToZchf(liquid * BPS / self.targetLtvBps)
+    if removable > coll_zchf:
+        removable = coll_zchf
+    return idle + realisable + removable
+
+# ================================== loop ====================================
+
+@internal
+def _invest(_assets: uint256):
+    if _assets == 0:
+        return
+    # dust guard: the wrapper silently donates assets that round to 0 shares
+    if staticcall IERC4626(SVZCHF).previewDeposit(_assets) == 0:
+        return
+
+    self._approve(ZCHF, SVZCHF, _assets)
+    shares: uint256 = extcall IERC4626(SVZCHF).deposit(_assets, self)
+    self._addCollateralAndBorrow(shares)
+    self._depositCrvUsdToYearn()
+
+@internal
+def _investIdle():
+    idle: uint256 = staticcall IERC20(ZCHF).balanceOf(self)
+    if idle > 0 and not self.shutdown:
+        self._invest(idle)
+
+@internal
+def _divest(_assets: uint256):
+    # 1. collapse accumulated crvUSD carry into ZCHF
+    self._realizeSurplus()
+
+    # 2. convert the extra crvUSD buffer into ZCHF so the redeemer is paid in ZCHF
+    buf: uint256 = self._bufferFor()
+    if buf > 0:
+        got: uint256 = self._redeemCrvUsdFromYearn(buf)
+        if got > 0:
+            log BufferConverted(got, self._swapCrvUsdToZchf(got))
+
+    idle: uint256 = staticcall IERC20(ZCHF).balanceOf(self)
+    if _assets <= idle:
+        return
+
+    coll_shares: uint256 = self._collateralShares()
+    if coll_shares == 0:
+        return
+
+    need: uint256 = _assets - idle
+    shares_to_remove: uint256 = staticcall IERC4626(SVZCHF).previewWithdraw(need)
+    if shares_to_remove > coll_shares:
+        shares_to_remove = coll_shares
+
+    # repay at the CURRENT effective LTV so leverage stays where the guard put it
+    repay_target: uint256 = (
+        self._sharesToCrvUsd(shares_to_remove) * self._effectiveLtvBps() / BPS
+    )
+    debt: uint256 = staticcall ILendController(CONTROLLER).debt(self)
+    if repay_target > debt:
+        repay_target = debt
+
+    redeemed: uint256 = self._redeemCrvUsdFromYearn(repay_target)
+    if redeemed > 0:
+        self._approve(CRVUSD, CONTROLLER, redeemed)
+        extcall ILendController(CONTROLLER).repay(redeemed, self)
+
+    # remove full collateral; LTV may drift up slightly rather than under-deliver
+    shares_to_remove = self._healthCapped(shares_to_remove)
+    if shares_to_remove > 0:
+        extcall ILendController(CONTROLLER).remove_collateral(shares_to_remove, self)
+        extcall IERC4626(SVZCHF).redeem(shares_to_remove, self, self)
+
+    self._depositCrvUsdToYearn()
+    log Divested(_assets, shares_to_remove, redeemed)
+
+@internal
+@view
+def _healthCapped(_shares: uint256) -> uint256:
+    if staticcall ILendController(CONTROLLER).debt(self) == 0:
+        return _shares
+    s: uint256 = _shares
+    for i: uint256 in range(5):
+        if s == 0:
+            break
+        if staticcall ILendController(CONTROLLER).remove_collateral_health_preview(s, self, False) >= 0:
+            return s
+        s = s * 9 / 10
+    return s
+
+@internal
+def _addCollateralAndBorrow(_collateralShares: uint256):
+    if _collateralShares == 0:
+        return
+    n: uint256 = self.bands
+    self._approve(SVZCHF, CONTROLLER, _collateralShares)
+
+    debt: uint256 = 0
+    more: uint256 = 0
+    if not staticcall ILendController(CONTROLLER).loan_exists(self):
+        max_debt: uint256 = staticcall ILendController(CONTROLLER).max_borrowable(
+            _collateralShares, n, self
+        )
+        debt = self._capByLiquidity(self._targetDebt(max_debt, 0))
+        extcall ILendController(CONTROLLER).create_loan(_collateralShares, debt, n, self)
+    else:
+        extcall ILendController(CONTROLLER).add_collateral(_collateralShares, self)
+        debt = staticcall ILendController(CONTROLLER).debt(self)
+        max_more: uint256 = staticcall ILendController(CONTROLLER).max_borrowable(0, n, self)
+        target_total: uint256 = self._targetDebt(max_more, debt)
+        if target_total > debt:
+            more = self._capByLiquidity(target_total - debt)
+            if more > 0:
+                extcall ILendController(CONTROLLER).borrow_more(0, more, self)
+    log Invested(_collateralShares, _collateralShares, debt + more)
+
+# @dev max_borrowable reports room at MAX ltv; rescale to the effective target.
+@internal
+@view
+def _targetDebt(_maxBorrowable: uint256, _currentDebt: uint256) -> uint256:
+    discount: uint256 = (
+        staticcall ILendController(CONTROLLER).loan_discount()
+        + staticcall ILendController(CONTROLLER).extra_health(self)
+    )
+    max_ltv: uint256 = WAD if discount >= WAD else WAD - discount
+    return (_maxBorrowable + _currentDebt) * (self._effectiveLtvBps() * WAD / BPS) / max_ltv
+
+@internal
+@view
+def _capByLiquidity(_debt: uint256) -> uint256:
+    cap: uint256 = staticcall ILendController(CONTROLLER).borrow_cap()
+    used: uint256 = staticcall ILendController(CONTROLLER).total_debt()
+    cap_left: uint256 = cap - used if cap > used else 0
+    avail: uint256 = staticcall ILendController(CONTROLLER).available_balance()
+    lim: uint256 = min(avail, cap_left)
+    return min(_debt, lim)
+
+@internal
+def _depositCrvUsdToYearn():
+    bal: uint256 = staticcall IERC20(CRVUSD).balanceOf(self)
+    if bal == 0:
+        return
+    lim: uint256 = staticcall IERC4626(YEARN_CRVUSD).maxDeposit(self)
+    bal = min(bal, lim)
+    if bal == 0:
+        return
+    self._approve(CRVUSD, YEARN_CRVUSD, bal)
+    extcall IERC4626(YEARN_CRVUSD).deposit(bal, self)
+
+@internal
+def _redeemCrvUsdFromYearn(_wanted: uint256) -> uint256:
+    if _wanted == 0:
+        return 0
+    shares: uint256 = staticcall IERC4626(YEARN_CRVUSD).previewWithdraw(_wanted)
+    max_shares: uint256 = staticcall IERC4626(YEARN_CRVUSD).maxRedeem(self)
+    shares = min(shares, max_shares)
+    if shares == 0:
+        return 0
+    before: uint256 = staticcall IERC20(CRVUSD).balanceOf(self)
+    extcall IERC4626(YEARN_CRVUSD).redeem(shares, self, self)
+    return staticcall IERC20(CRVUSD).balanceOf(self) - before
+
+# ========================== crvUSD leg reconciliation =======================
+
+@external
+@view
+def crvUsdLeg() -> int256:
+    return self._crvUsdLeg()
+
+@internal
+@view
+def _crvUsdLeg() -> int256:
+    yearn_assets: uint256 = staticcall IERC4626(YEARN_CRVUSD).convertToAssets(
+        staticcall IERC20(YEARN_CRVUSD).balanceOf(self)
+    )
+    debt: uint256 = staticcall ILendController(CONTROLLER).debt(self)
+    return convert(yearn_assets, int256) - convert(debt, int256)
+
+@internal
+@view
+def _crvUsdSurplus() -> uint256:
+    leg: int256 = self._crvUsdLeg()
+    return convert(leg, uint256) if leg > 0 else 0
+
+@internal
+@view
+def _crvUsdDeficit() -> uint256:
+    leg: int256 = self._crvUsdLeg()
+    return convert(-leg, uint256) if leg < 0 else 0
+
+# @dev The crvUSD leg is only a hedge sized to the debt; anything above it is earned
+#      carry and must leave the leg. Frees crvUSD WITHOUT repaying.
+@internal
+def _realizeSurplus() -> uint256:
+    surplus: uint256 = self._crvUsdSurplus()
+    if surplus == 0 or surplus < self.minConvertCrvUsd:
+        return 0
+    got: uint256 = self._redeemCrvUsdFromYearn(surplus)
+    if got == 0:
+        return 0
+    zchf_out: uint256 = self._swapCrvUsdToZchf(got)
+    log SurplusRealized(got, zchf_out)
+    return zchf_out
+
+# @dev Borrow interest outran the Yearn yield: refill the leg by swapping ZCHF -> crvUSD.
+@internal
+def _coverDeficit():
+    deficit: uint256 = self._crvUsdDeficit()
+    if deficit == 0:
+        return
+
+    zchf_needed: uint256 = self._crvUsdToZchf(deficit)
+    idle: uint256 = staticcall IERC20(ZCHF).balanceOf(self)
+
+    if idle < zchf_needed:
+        coll_shares: uint256 = self._collateralShares()
+        if coll_shares > 0:
+            shares: uint256 = staticcall IERC4626(SVZCHF).previewWithdraw(zchf_needed - idle)
+            shares = self._healthCapped(min(shares, coll_shares))
+            if shares > 0:
+                extcall ILendController(CONTROLLER).remove_collateral(shares, self)
+                extcall IERC4626(SVZCHF).redeem(shares, self, self)
+
+    bal: uint256 = staticcall IERC20(ZCHF).balanceOf(self)
+    to_swap: uint256 = min(bal, zchf_needed)
+    if to_swap == 0:
+        return
+
+    got: uint256 = self._swapZchfToCrvUsd(to_swap)
+    if got > 0:
+        self._approve(CRVUSD, CONTROLLER, got)
+        extcall ILendController(CONTROLLER).repay(got, self)  # repaying raises the leg toward 0
+    log DeficitCovered(to_swap, got)
+
+# @dev Extra crvUSD pulled from the Yearn vault and converted to ZCHF on withdraw.
+@internal
+@view
+def _bufferFor() -> uint256:
+    buf: uint256 = self.withdrawCrvUsdBuffer
+    if buf == 0 or buf < self.minConvertCrvUsd:
+        return 0
+    yearn_assets: uint256 = staticcall IERC4626(YEARN_CRVUSD).convertToAssets(
+        staticcall IERC20(YEARN_CRVUSD).balanceOf(self)
+    )
+    if yearn_assets == 0:
+        return 0
+    return min(buf, yearn_assets * self.bufferMaxBps / BPS)
+
+# ================================== swaps ===================================
+
+@internal
+def _swapCrvUsdToZchf(_amount: uint256) -> uint256:
+    p: address = self.crvUsdZchfPool
+    if p == empty(address):
+        return _amount  # documented 1:1 fallback
+    dy: uint256 = staticcall ICurveStableSwap(p).get_dy(self.iCrvUsd, self.iZchf, _amount)
+    min_out: uint256 = dy * (BPS - self.maxSlippageBps) / BPS
+    self._approve(CRVUSD, p, _amount)
+    return extcall ICurveStableSwap(p).exchange(self.iCrvUsd, self.iZchf, _amount, min_out)
+
+@internal
+def _swapZchfToCrvUsd(_amount: uint256) -> uint256:
+    p: address = self.crvUsdZchfPool
+    if p == empty(address):
+        return _amount
+    dy: uint256 = staticcall ICurveStableSwap(p).get_dy(self.iZchf, self.iCrvUsd, _amount)
+    min_out: uint256 = dy * (BPS - self.maxSlippageBps) / BPS
+    self._approve(ZCHF, p, _amount)
+    return extcall ICurveStableSwap(p).exchange(self.iZchf, self.iCrvUsd, _amount, min_out)
+
+# ============================== misc helpers ================================
+
+@internal
+@view
+def _collateralShares() -> uint256:
+    return staticcall ILendController(CONTROLLER).user_state(self)[0]
+
+@internal
+@view
+def _sharesToCrvUsd(_shares: uint256) -> uint256:
+    return _shares * self._oraclePrice() / WAD
+
+# @dev crvUSD -> ZCHF via the market oracle + the svZCHF exchange rate.
+@internal
+@view
+def _crvUsdToZchf(_crvUsd: uint256) -> uint256:
+    if _crvUsd == 0:
+        return 0
+    p: uint256 = self._oraclePrice()
+    share_price: uint256 = staticcall IERC4626(SVZCHF).convertToAssets(WAD)
+    if p == 0 or share_price == 0:
+        return _crvUsd
+    return _crvUsd * share_price / p
+
+@internal
+@view
+def _oraclePrice() -> uint256:
+    amm: address = staticcall ILendController(CONTROLLER).amm()
+    p: uint256 = staticcall IAMM(amm).price_oracle()
+    if p == 0:
+        p = staticcall IERC4626(SVZCHF).convertToAssets(WAD)
+    return p
+
+# @dev VaultV3 StrategyParams { activation, last_report, current_debt, max_debt }.
+@internal
+@view
+def _vaultDebt() -> uint256:
+    v: address = self.vault
+    if v == empty(address):
+        return self.lastTotalAssets
+    data: Bytes[36] = concat(
+        method_id("strategies(address)", output_type=Bytes[4]), convert(self, bytes32)
+    )
+    res: Bytes[128] = raw_call(v, data, max_outsize=128, is_static_call=True, revert_on_failure=False)
+    if len(res) < 128:
+        return self.lastTotalAssets
+    params: uint256[4] = abi_decode(res, uint256[4])
+    return params[2]
+
+@internal
+def _spread() -> int256:
+    return convert(self.cachedLendApr, int256) - convert(self._borrowApr(), int256)
+
+@internal
+def _approve(_token: address, _spender: address, _amount: uint256):
+    if staticcall IERC20(_token).allowance(self, _spender) < _amount:
+        assert extcall IERC20(_token).approve(_spender, 0), "approve0"
+        assert extcall IERC20(_token).approve(_spender, _amount), "approve"
